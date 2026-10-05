@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "أكاديمية دوز للعلوم الطبيعية"
+description = "معاينة تشغيلية لأحدث نسخة من تطبيق أكاديمية دوز المستخرجة من أرشيف المشروع، من دون تغيير شيفرة المصدر."
+version = "1.0.0"
+id = "artifacts/douz-academy"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 18757
+
+[services.development]
+run = "pnpm --filter @workspace/douz-academy run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/douz-academy", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/douz-academy/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "18757"
+BASE_PATH = "/"

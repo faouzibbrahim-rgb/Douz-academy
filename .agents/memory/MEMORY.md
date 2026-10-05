@@ -1,0 +1,1 @@
+- [Manual artifact builds](manual-artifact-builds.md) — managed Vite workflows inject environment values that standalone builds need.

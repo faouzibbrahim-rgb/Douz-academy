@@ -21,6 +21,13 @@ interface Participant {
 }
 interface ChatMsg { id: string; name: string; isAdmin: boolean; text: string; time: string; }
 interface WaitingEntry { socketId: string; name: string; requestedAt: number; }
+interface PeerNegotiationState {
+  makingOffer: boolean;
+  settingRemoteAnswer: boolean;
+  ignoreOffer: boolean;
+  needsNegotiation: boolean;
+  polite: boolean;
+}
 
 interface Props {
   room: LiveRoom;
@@ -114,7 +121,8 @@ const ICE_SERVERS = {
 export default function NativeLiveRoom({ room, isAdmin, userName, onBack, onSaveRecording }: Props) {
   // ── State ──────────────────────────────────────────────────
   const [socket, setSocket] = useState<Socket | null>(null);
-  const [phase, setPhase] = useState<"connecting" | "lobby-wait" | "in-room" | "rejected" | "kicked">("connecting");
+  const [phase, setPhase] = useState<"connecting" | "connection-error" | "lobby-wait" | "in-room" | "rejected" | "kicked">("connecting");
+  const [connectionError, setConnectionError] = useState<string | null>(null);
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [waiting, setWaiting] = useState<WaitingEntry[]>([]);
   const [chatMsgs, setChatMsgs] = useState<ChatMsg[]>([]);
@@ -157,6 +165,8 @@ export default function NativeLiveRoom({ room, isAdmin, userName, onBack, onSave
 
   // WebRTC
   const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const negotiationStatesRef = useRef<Map<string, PeerNegotiationState>>(new Map());
+  const pendingIceCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
   const [remoteStreams, setRemoteStreams] = useState<Map<string, MediaStream>>(new Map());
   const remoteVideoRefs = useRef<Map<string, HTMLVideoElement>>(new Map());
   const chatEndRef = useRef<HTMLDivElement>(null);
@@ -193,8 +203,45 @@ export default function NativeLiveRoom({ room, isAdmin, userName, onBack, onSave
   // ── WebRTC: create peer ────────────────────────────────────
   const createPeer = useCallback((s: Socket, remoteId: string): RTCPeerConnection => {
     peersRef.current.get(remoteId)?.close();
+    negotiationStatesRef.current.delete(remoteId);
     const pc = new RTCPeerConnection(ICE_SERVERS);
     peersRef.current.set(remoteId, pc);
+    const negotiationState: PeerNegotiationState = {
+      makingOffer: false,
+      settingRemoteAnswer: false,
+      ignoreOffer: false,
+      needsNegotiation: false,
+      polite: !isAdmin,
+    };
+    negotiationStatesRef.current.set(remoteId, negotiationState);
+
+    const negotiate = async () => {
+      if (!negotiationState.needsNegotiation || negotiationState.makingOffer || pc.signalingState !== "stable") return;
+      negotiationState.needsNegotiation = false;
+      negotiationState.makingOffer = true;
+      try {
+        await pc.setLocalDescription(await pc.createOffer());
+        if (pc.localDescription) {
+          s.emit("rtc:offer", { targetSocketId: remoteId, offer: pc.localDescription });
+        }
+      } catch (err) {
+        negotiationState.needsNegotiation = true;
+        const message = err instanceof Error ? err.message : String(err);
+        setMediaError("تعذّر تهيئة اتصال الفيديو: " + message);
+      } finally {
+        negotiationState.makingOffer = false;
+      }
+    };
+
+    pc.onnegotiationneeded = () => {
+      negotiationState.needsNegotiation = true;
+      void negotiate();
+    };
+    pc.onsignalingstatechange = () => {
+      if (pc.signalingState === "stable" && negotiationState.needsNegotiation) {
+        void negotiate();
+      }
+    };
 
     pc.onicecandidate = (e) => {
       if (e.candidate) s.emit("rtc:ice", { targetSocketId: remoteId, candidate: e.candidate.toJSON() });
@@ -211,26 +258,44 @@ export default function NativeLiveRoom({ room, isAdmin, userName, onBack, onSave
       });
     };
 
-    // Add local tracks if admin
-    if (isAdmin && localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach(t => {
-        try { pc.addTrack(t, localStreamRef.current!); } catch {}
+    // The teacher initiates receive-capable transceivers even before camera
+    // or microphone are enabled. Later track changes renegotiate automatically.
+    if (isAdmin) {
+      pc.addTransceiver("audio", { direction: "recvonly" });
+      pc.addTransceiver("video", { direction: "recvonly" });
+      localStreamRef.current?.getTracks().forEach((track) => {
+        try { pc.addTrack(track, localStreamRef.current!); } catch {}
       });
     }
     return pc;
   }, [isAdmin]);
 
-  const initiateOffer = useCallback(async (s: Socket, targetSocketId: string) => {
-    const pc = createPeer(s, targetSocketId);
-    const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
-    await pc.setLocalDescription(offer);
-    s.emit("rtc:offer", { targetSocketId, offer });
+  const initiateOffer = useCallback((s: Socket, targetSocketId: string) => {
+    createPeer(s, targetSocketId);
   }, [createPeer]);
 
   const closePeer = (socketId: string) => {
     peersRef.current.get(socketId)?.close();
     peersRef.current.delete(socketId);
+    negotiationStatesRef.current.delete(socketId);
+    pendingIceCandidatesRef.current.delete(socketId);
     setRemoteStreams(prev => { const n = new Map(prev); n.delete(socketId); return n; });
+  };
+
+  const flushPendingIce = async (remoteId: string) => {
+    const pc = peersRef.current.get(remoteId);
+    if (!pc?.remoteDescription) return;
+    const candidates = pendingIceCandidatesRef.current.get(remoteId) ?? [];
+    pendingIceCandidatesRef.current.delete(remoteId);
+    for (const candidate of candidates) {
+      await pc.addIceCandidate(candidate).catch((err) => {
+        const state = negotiationStatesRef.current.get(remoteId);
+        if (!state?.ignoreOffer) {
+          const message = err instanceof Error ? err.message : String(err);
+          setMediaError("تعذّر تهيئة اتصال الشبكة: " + message);
+        }
+      });
+    }
   };
 
   // ── Socket setup ───────────────────────────────────────────
@@ -239,8 +304,21 @@ export default function NativeLiveRoom({ room, isAdmin, userName, onBack, onSave
     setSocket(s);
 
     s.on("connect", () => {
+      setConnectionError(null);
       if (isAdmin) s.emit("room:join-admin", { roomCode: room.roomCode, name: userName });
       else s.emit("room:request-entry", { roomCode: room.roomCode, name: userName });
+    });
+
+    s.on("connect_error", (error) => {
+      setConnectionError(error.message || "تعذّر الاتصال بخدمة البث.");
+      setPhase("connection-error");
+    });
+
+    s.on("disconnect", (reason) => {
+      if (reason === "io server disconnect") {
+        setConnectionError("انقطع الاتصال بخدمة البث. أعد المحاولة.");
+        setPhase("connection-error");
+      }
     });
 
     s.on("lobby:waiting", () => setPhase("lobby-wait"));
@@ -288,21 +366,67 @@ export default function NativeLiveRoom({ room, isAdmin, userName, onBack, onSave
 
     // WebRTC signaling
     s.on("rtc:offer", async ({ from, offer }: { from: string; offer: RTCSessionDescriptionInit }) => {
-      const pc = createPeer(s, from);
-      await pc.setRemoteDescription(offer);
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      s.emit("rtc:answer", { targetSocketId: from, answer });
+      const pc = peersRef.current.get(from) ?? createPeer(s, from);
+      const negotiationState = negotiationStatesRef.current.get(from);
+      if (!negotiationState) return;
+
+      const readyForOffer =
+        !negotiationState.makingOffer &&
+        (pc.signalingState === "stable" || negotiationState.settingRemoteAnswer);
+      const offerCollision = offer.type === "offer" && !readyForOffer;
+      negotiationState.ignoreOffer = !negotiationState.polite && offerCollision;
+      if (negotiationState.ignoreOffer) return;
+
+      try {
+        negotiationState.settingRemoteAnswer = offer.type === "answer";
+        await pc.setRemoteDescription(offer);
+        negotiationState.settingRemoteAnswer = false;
+        await flushPendingIce(from);
+
+        if (offer.type === "offer") {
+          await pc.setLocalDescription(await pc.createAnswer());
+          if (pc.localDescription) {
+            s.emit("rtc:answer", { targetSocketId: from, answer: pc.localDescription });
+          }
+        }
+      } catch (err) {
+        negotiationState.settingRemoteAnswer = false;
+        const message = err instanceof Error ? err.message : String(err);
+        setMediaError("تعذّر تهيئة اتصال الفيديو: " + message);
+      }
     });
 
     s.on("rtc:answer", async ({ from, answer }: { from: string; answer: RTCSessionDescriptionInit }) => {
       const pc = peersRef.current.get(from);
-      if (pc && pc.signalingState !== "stable") await pc.setRemoteDescription(answer).catch(() => {});
+      const negotiationState = negotiationStatesRef.current.get(from);
+      if (!pc || !negotiationState || pc.signalingState === "stable") return;
+      try {
+        negotiationState.settingRemoteAnswer = true;
+        await pc.setRemoteDescription(answer);
+        negotiationState.settingRemoteAnswer = false;
+        await flushPendingIce(from);
+      } catch (err) {
+        negotiationState.settingRemoteAnswer = false;
+        const message = err instanceof Error ? err.message : String(err);
+        setMediaError("تعذّر تهيئة اتصال الفيديو: " + message);
+      }
     });
 
     s.on("rtc:ice", async ({ from, candidate }: { from: string; candidate: RTCIceCandidateInit }) => {
       const pc = peersRef.current.get(from);
-      if (pc) await pc.addIceCandidate(candidate).catch(() => {});
+      if (!pc?.remoteDescription) {
+        const pending = pendingIceCandidatesRef.current.get(from) ?? [];
+        pending.push(candidate);
+        pendingIceCandidatesRef.current.set(from, pending);
+        return;
+      }
+      await pc.addIceCandidate(candidate).catch((err) => {
+        const negotiationState = negotiationStatesRef.current.get(from);
+        if (!negotiationState?.ignoreOffer) {
+          const message = err instanceof Error ? err.message : String(err);
+          setMediaError("تعذّر تهيئة اتصال الشبكة: " + message);
+        }
+      });
     });
 
     return () => {
@@ -310,6 +434,9 @@ export default function NativeLiveRoom({ room, isAdmin, userName, onBack, onSave
       s.disconnect();
       stopAllMedia();
       peersRef.current.forEach(pc => pc.close());
+      peersRef.current.clear();
+      negotiationStatesRef.current.clear();
+      pendingIceCandidatesRef.current.clear();
       if (isFullscreen) exitFullscreen();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -694,6 +821,18 @@ export default function NativeLiveRoom({ room, isAdmin, userName, onBack, onSave
     <div className="min-h-[60vh] flex flex-col items-center justify-center gap-4">
       <div className="w-10 h-10 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin" />
       <p className="text-slate-600 font-bold text-sm">جاري الاتصال بالغرفة...</p>
+    </div>
+  );
+
+  if (phase === "connection-error") return (
+    <div className="min-h-[60vh] flex flex-col items-center justify-center gap-4 text-center">
+      <div className="w-16 h-16 bg-red-100 rounded-2xl flex items-center justify-center"><X className="w-8 h-8 text-red-600" /></div>
+      <h3 className="font-black text-slate-900">تعذّر الاتصال بغرفة البث</h3>
+      <p className="max-w-md text-sm text-slate-600">{connectionError ?? "تحقق من اتصال الإنترنت ثم أعد المحاولة."}</p>
+      <div className="flex gap-2">
+        <button onClick={() => { setPhase("connecting"); setConnectionError(null); socket?.connect(); }} className="bg-emerald-600 hover:bg-emerald-700 text-white font-black px-5 py-2.5 rounded-xl text-sm">إعادة المحاولة</button>
+        <button onClick={onBack} className="bg-slate-100 hover:bg-slate-200 text-slate-700 font-black px-5 py-2.5 rounded-xl text-sm flex items-center gap-2"><ArrowRight className="w-4 h-4" /> رجوع</button>
+      </div>
     </div>
   );
 
